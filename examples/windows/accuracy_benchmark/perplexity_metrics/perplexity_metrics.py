@@ -138,7 +138,8 @@ def perplexity_eval(model_dir, input_len=1024, chunk_size=None):
             print(f"[CONFIG] Using provided chunk_size: {effective_chunk_size}")
     elif model_cfg_json and "search" in model_cfg_json and "chunk_size" in model_cfg_json["search"]:
         # Use chunk_size from existing config file
-        effective_chunk_size = config["search"]["chunk_size"]
+        effective_chunk_size = model_cfg_json["search"]["chunk_size"]
+        kv_chunking_enabled = True
         kv_chunking_enabled = True
         if DEBUG:
             print(f"[CONFIG] Using config file chunk_size: {effective_chunk_size}")
