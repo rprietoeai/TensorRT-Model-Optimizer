@@ -54,11 +54,6 @@ def get_tokenizer(ckpt_path, trust_remote_code=False, **kwargs):
         ckpt_path, trust_remote_code=trust_remote_code, **kwargs
     )
 
-    if "qwen" in type(tokenizer).__name__.lower():
-        # qwen use token id 151643 as pad and eos tokens
-        tokenizer.pad_token = tokenizer.convert_ids_to_tokens(151643)
-        tokenizer.eos_token = tokenizer.convert_ids_to_tokens(151643)
-
     # can't set attribute 'pad_token' for "<unk>"
     # We skip this step for Nemo models
     if tokenizer.pad_token != "<unk>" or tokenizer.pad_token is None:
@@ -204,9 +199,7 @@ def get_model(
                 if auto_model_module != AutoModelForCausalLM:
                     model_kwargs2.pop("trust_remote_code", None)
                 model_kwargs2["torch_dtype"] = torch_dtype
-                # DeciLMForCausalLM does not support max_memory argument
-                if "architectures" in hf_config and "DeciLMForCausalLM" in hf_config.architectures:
-                    model_kwargs2.pop("max_memory", None)
+                model_kwargs2.pop("max_memory", None)
                 model = from_config(hf_config, **model_kwargs2)
 
             max_memory = get_max_memory()

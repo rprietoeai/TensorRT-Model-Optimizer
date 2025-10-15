@@ -61,12 +61,6 @@ __all__ = [  # noqa: RUF022
     "replace_forward",
 ]
 
-# we have two different numbers here since during training it might take longer to stabilize
-MODELOPT_QUEUE_MAXLEN = 50  # indicates length of modelopt data queue for BN calib
-MODELOPT_BN_CALIB_ITERS = (
-    100  # indicates # iters in train mode 'til we trust BN stats without calib
-)
-
 
 @contextmanager
 def batch_norm_ignored_flops():
@@ -116,7 +110,7 @@ def inference_flops(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         with batch_norm_ignored_flops():
-            flops = profile.profile_macs(network, args=dummy_input)
+            flops = 2 * profile.profile_macs(network, args=dummy_input)
     network.train(is_training)
     if return_str:
         return num2hrb(flops)
