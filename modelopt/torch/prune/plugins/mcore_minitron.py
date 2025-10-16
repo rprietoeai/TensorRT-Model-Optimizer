@@ -24,26 +24,39 @@ Supports both GPT (attention-based) and Mamba (state-space) models, as well as h
 Actual dynamic module implementations are at :mod:`modelopt.torch.nas.plugins.megatron`.
 """
 
-from warnings import warn
+import copy
 
 import torch
+import torch.nn as nn
 from pydantic import create_model
 
 # isort: off
-# import nas plugin to check if it is enabled else raises an Exception
+# import nas plugin to check if it is enabled else raises an Exception and disables the plugin
 from modelopt.torch.nas.plugins.megatron import *  # noqa: F403
-from modelopt.torch.nas.plugins.megatron import HAS_MAMBA
+from modelopt.torch.nas.plugins.megatron import (
+    HAS_MAMBA,
+    _DynamicMCoreLanguageModel,
+    SUPPORTED_MODELS,
+    drop_mcore_language_model_layers,
+)
 # isort: on
 
 from modelopt.torch.nas.conversion import NASModeRegistry
 from modelopt.torch.nas.registry import DMRegistry
-from modelopt.torch.nas.utils import sort_parameters
+from modelopt.torch.nas.utils import get_subnet_config, sort_parameters
 from modelopt.torch.opt.config import ModeloptBaseConfig, get_kwargs_for_create_model_with_rules
+from modelopt.torch.opt.conversion import ApplyModeError
+from modelopt.torch.opt.dynamic import DynamicSpace
+from modelopt.torch.opt.mode import (
+    ConvertEntrypoint,
+    ConvertReturnType,
+    ModeDescriptor,
+    RestoreEntrypoint,
+)
 from modelopt.torch.opt.searcher import BaseSearcher, SearchConfig, SearchStateDict
 from modelopt.torch.opt.utils import named_hparams
 from modelopt.torch.utils import print_rank_0
 
-from ..fastnas import FastNASModeDescriptor
 from ..pruning import PruneModeRegistry
 
 SUPPORTED_HPARAMS = {
@@ -58,26 +71,41 @@ SUPPORTED_HPARAMS = {
     "num_layers",
 }
 
+__all__ = [
+    "SUPPORTED_HPARAMS",
+    "MCoreMinitronConfig",
+    "MCoreMinitronModeDescriptor",
+    "MCoreMinitronSearcher",
+    "drop_mcore_language_model_layers",
+]
+
 
 class MCoreMinitronSearcher(BaseSearcher):
     """Searcher for Minitron pruning algorithm."""
 
+    activations_per_rank: list[dict[str, torch.Tensor]]
+    layer_scores: dict[int, torch.Tensor]
+
     @property
     def default_search_config(self) -> SearchConfig:
         """Get the default config for the searcher."""
-        return {**super().default_search_config, "max_iter_data_loader": 1024}
+        return {
+            **super().default_search_config,
+            "max_iter_data_loader": 1024,
+            "skip_sorting": False,
+            "scores_path": None,
+        }
 
     @property
     def default_state_dict(self) -> SearchStateDict:
-        """Return default state dict."""
-        return {}  # Not used
+        """Return default state dict for importance scores and activations from forward loop."""
+        return {"activations_per_rank": [], "layer_scores": {}}
 
     def sanitize_search_config(self, config: SearchConfig | None) -> SearchConfig:
         """Sanitize the search config dict."""
         config = super().sanitize_search_config(config)
-        assert config["data_loader"] or config["forward_loop"], (
-            "Data loader or forward loop must be provided for importance estimation!"
-        )
+        config["checkpoint"] = config["scores_path"]
+        config["verbose"] = True  # Print for all ranks
         return config
 
     def before_search(self) -> None:
@@ -89,10 +117,11 @@ class MCoreMinitronSearcher(BaseSearcher):
             "Only `export_config` constraint is supported for pruning!"
         )
 
+        self.constraints["export_config"] = copy.deepcopy(self.constraints["export_config"])
         export_config = self.constraints["export_config"]
         assert isinstance(export_config, dict)  # to keep mypy happy
         assert export_config.keys() <= SUPPORTED_HPARAMS, (
-            f"Only {SUPPORTED_HPARAMS} are supported for pruning!"
+            f"Only {SUPPORTED_HPARAMS} are supported for pruning! Received: {export_config.keys()}"
         )
 
         assert ("num_attention_heads" in export_config and "num_query_groups" in export_config) or (
@@ -126,14 +155,37 @@ class MCoreMinitronSearcher(BaseSearcher):
     def run_search(self) -> None:
         """Run actual search."""
         # Run forward loop to collect activations and sort parameters
-        assert self.forward_loop is not None
-        is_training = self.model.training
-        self.model.eval()
-        print_rank_0("Running forward loop...")
-        with torch.no_grad():
-            self.forward_loop(self.model)
-        sort_parameters(self.model, self.hps_to_sort, verbose=True)
-        self.model.train(is_training)
+        unwrapped_model = self.model
+        for m in self.model.modules():
+            if isinstance(m, _DynamicMCoreLanguageModel):
+                unwrapped_model = m
+                break
+        assert isinstance(unwrapped_model, _DynamicMCoreLanguageModel), "Model not supported!"
+
+        if self.layer_scores and self.activations_per_rank:  # Available from checkpoint
+            print_rank_0("Loading activations and scores per rank from checkpoint...")
+            unwrapped_model.set_activations_and_layer_scores(
+                self.activations_per_rank, self.layer_scores
+            )
+        elif not self.config["skip_sorting"]:
+            print_rank_0("Running forward loop...")
+            assert self.forward_loop is not None
+            is_training = self.model.training
+            self.model.eval()
+            with torch.no_grad():
+                self.forward_loop(self.model)
+            self.model.train(is_training)
+
+            # Store activations and layer scores for re-pruning with different export configs
+            self.activations_per_rank, self.layer_scores = (
+                unwrapped_model.get_activations_and_layer_scores()
+            )
+            self.save_search_checkpoint(verbose=True)
+
+        if self.config["skip_sorting"]:
+            print_rank_0("Skipping sorting parameters...")
+        else:
+            sort_parameters(self.model, self.hps_to_sort, verbose=True)
 
         # Prune homogeneously
         export_config = self.constraints["export_config"]
@@ -187,9 +239,48 @@ MCoreMinitronConfig: type[ModeloptBaseConfig] = create_model(
 )
 
 
+def _convert_model_to_dynamic_space(
+    model: nn.Module, config: ModeloptBaseConfig | None = None
+) -> DynamicSpace:
+    """Create a dynamic space for the model (in-place)."""
+    dynamic_space = DynamicSpace(model)
+    dynamic_space._should_be_converted = lambda mod: isinstance(mod, tuple(SUPPORTED_MODELS.keys()))
+    dynamic_space.convert_to_dynamic(config.model_dump() if config else None, DMRegistry)
+    if not dynamic_space.is_configurable():
+        raise ApplyModeError(
+            "The model does not contain any configurable hyperparameters! Please check the"
+            " documentation for modules and config and how to get a configurable model."
+        )
+
+    return dynamic_space
+
+
+def convert_mcore_minitron(model: nn.Module, config: ModeloptBaseConfig) -> ConvertReturnType:
+    """Convert the model to the dynamic search space (in-place) and return the converted model and metadata.
+
+    This is a simplified version of convert_fastnas_searchspace that removes the automated recursive tracing
+    and instead directly converts the top-level model to a DynamicModule. Submodules should not need to be explicitly
+    converted as that happens from the top-level model.
+    """
+    _convert_model_to_dynamic_space(model, config)
+
+    # store current config in metadata
+    metadata = {"subnet_config": get_subnet_config(model)}
+
+    # return converted model as well as metadata
+    return model, metadata
+
+
+def restore_mcore_minitron(
+    model: nn.Module, config: ModeloptBaseConfig, metadata: dict
+) -> nn.Module:
+    """Restore the model (no-op since we don't want to convert again which forces TP=1)."""
+    return model
+
+
 @NASModeRegistry.register_mode
 @PruneModeRegistry.register_mode
-class MCoreMinitronModeDescriptor(FastNASModeDescriptor):
+class MCoreMinitronModeDescriptor(ModeDescriptor):
     """Class to describe the ``"mcore_minitron"`` mode.
 
     The properties of this mode can be inspected via the source code.
@@ -206,25 +297,26 @@ class MCoreMinitronModeDescriptor(FastNASModeDescriptor):
         return MCoreMinitronConfig
 
     @property
-    def search_algorithm(self) -> type[BaseSearcher]:
-        """Specifies the search algorithm to use for this mode (if any)."""
-        return MCoreMinitronSearcher
-
-
-@NASModeRegistry.register_mode
-@PruneModeRegistry.register_mode
-class MCoreGPTMinitronModeDescriptor(MCoreMinitronModeDescriptor):
-    """[Deprecated] Class to describe the ``"mcore_gpt_minitron"`` mode.
-
-    The properties of this mode can be inspected via the source code.
-    """
+    def next_modes(self) -> set[str] | None:
+        """Modes that must immediately follow this mode."""
+        return {"export_nas", "kd_loss", "quantize", "sparse_magnitude", "sparse_gpt"}
 
     @property
-    def name(self) -> str:
-        """Returns the value (str representation) of the mode."""
-        warn(
-            "`mcore_gpt_minitron` mode is deprecated will be removed in a later release. "
-            "Please use `mcore_minitron` instead.",
-            DeprecationWarning,
-        )
-        return "mcore_gpt_minitron"
+    def export_mode(self) -> str | None:
+        """The mode that corresponds to the export mode of this mode."""
+        return "export_nas"
+
+    @property
+    def search_algorithm(self) -> type[BaseSearcher]:
+        """Specifies the search algorithm to use for this mode."""
+        return MCoreMinitronSearcher
+
+    @property
+    def convert(self) -> ConvertEntrypoint:
+        """The mode's entrypoint for converting a model to a search space."""
+        return convert_mcore_minitron
+
+    @property
+    def restore(self) -> RestoreEntrypoint:
+        """The mode's entrypoint for restoring a model with the modelopt_state."""
+        return restore_mcore_minitron

@@ -27,6 +27,7 @@ def test_llama_eagle3(tiny_llama_path, num_gpus, tiny_daring_anteater_path, tmp_
         "intermediate_size": 64,
         "num_attention_heads": 2,
         "num_key_value_heads": 2,
+        "head_dim": 64,
     }
 
     # Write the tiny config to a temporary file
@@ -36,12 +37,11 @@ def test_llama_eagle3(tiny_llama_path, num_gpus, tiny_daring_anteater_path, tmp_
 
     run_example_command(
         [
-            "./launch.sh",
+            "./launch_train.sh",
             "--model", tiny_llama_path,
             "--data", tiny_daring_anteater_path,
             "--num_epochs", "1",
             "--lr", "1e-5",
-            "--do_eval", "False",
             "--num_gpu", str(num_gpus),
             "--mode", "eagle3",
             "--eagle_config", str(config_file),

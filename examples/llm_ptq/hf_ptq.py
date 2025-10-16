@@ -23,7 +23,14 @@ from typing import Any
 import numpy as np
 import torch
 from accelerate.hooks import remove_hook_from_module
-from example_utils import apply_kv_cache_quant, get_model, get_processor, get_tokenizer, is_enc_dec
+from example_utils import (
+    apply_kv_cache_quant,
+    copy_custom_model_files,
+    get_model,
+    get_processor,
+    get_tokenizer,
+    is_enc_dec,
+)
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -61,6 +68,7 @@ RAND_SEED = 1234
 QUANT_CFG_CHOICES: dict[str, dict[str, Any]] = {
     "int8": mtq.INT8_DEFAULT_CFG,
     "int8_sq": mtq.INT8_SMOOTHQUANT_CFG,
+    "int8_wo": mtq.INT8_WEIGHT_ONLY_CFG,
     "fp8": mtq.FP8_DEFAULT_CFG,
     "int4_awq": mtq.INT4_AWQ_CFG,
     "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
@@ -93,6 +101,8 @@ def auto_quantize(
         qformat
         in [
             "fp8",
+            "int8_sq",
+            "int8_wo",
             "int4_awq",
             "nvfp4",
             "nvfp4_awq",
@@ -215,6 +225,7 @@ def main(args):
         assert (
             args.qformat
             in [
+                "int8_wo",
                 "int4_awq",
                 "fp8",
                 "nvfp4",
@@ -286,8 +297,14 @@ def main(args):
         )
     else:
         if args.dataset is None:
-            args.dataset = ["cnn_dailymail"]
-            warnings.warn("No dataset specified. Defaulting to cnn_dailymail.")
+            args.dataset = ["cnn_dailymail", "nemotron-post-training-dataset-v2"]
+            warnings.warn(
+                "No dataset specified. Defaulting to cnn_dailymail and nemotron-post-training-dataset-v2."
+            )
+        # Adjust calib_size to match dataset length by extending or truncating as needed
+        args.calib_size = (args.calib_size + [args.calib_size[-1]] * len(args.dataset))[
+            : len(args.dataset)
+        ]
         tokenizer = get_tokenizer(args.pyt_ckpt_path, trust_remote_code=args.trust_remote_code)
 
         default_padding_side = tokenizer.padding_side
@@ -315,6 +332,10 @@ def main(args):
                     mtq.quantize(child, disabled_quant_cfg, forward_loop=None)
 
             model = model.language_model
+            model_type = get_model_type(model)
+
+    if model_type == "phi4mm":
+        warnings.warn("Please set the default input_mode to InputMode.LANGUAGE before quantizing.")
 
     if args.sparsity_fmt != "dense":
         if args.batch_size == 0:
@@ -334,6 +355,7 @@ def main(args):
             tokenizer=tokenizer,
             batch_size=args.batch_size,
             num_samples=args.calib_size,
+            max_sample_length=args.calib_seq,
             device=device,
         )
         model = mts.sparsify(
@@ -375,6 +397,7 @@ def main(args):
 
             args.batch_size = get_max_batch_size(
                 model,
+                max_sample_length=args.calib_seq,
                 sample_memory_usage_ratio=sample_memory_usage_ratio if not run_auto_quant else 1.0,
                 sample_input_single_batch=sample_input_single_batch,
                 enable_grad=run_auto_quant,
@@ -466,9 +489,6 @@ def main(args):
                 quant_cfg["quant_cfg"]["*audio*"] = {"enable": False}
                 quant_cfg["quant_cfg"]["*image*"] = {"enable": False}
                 quant_cfg["quant_cfg"]["*vision*"] = {"enable": False}
-                warnings.warn(
-                    "Please set the default input_mode to InputMode.LANGUAGE before quantizing."
-                )
 
         if not model_is_already_quantized or calibration_only:
             # Only run single sample for preview
@@ -602,6 +622,9 @@ def main(args):
                 inference_tensor_parallel=args.inference_tensor_parallel,
                 inference_pipeline_parallel=args.inference_pipeline_parallel,
             )
+
+            # Copy custom model files (Python files and JSON configs) for TensorRT-LLM export
+            copy_custom_model_files(args.pyt_ckpt_path, export_path, args.trust_remote_code)
         else:
             # Check arguments for unified_hf export format and set to default if unsupported arguments are provided
             assert args.sparsity_fmt == "dense", (
@@ -618,6 +641,9 @@ def main(args):
                 full_model,
                 export_dir=export_path,
             )
+
+        # Copy custom model files (Python files and JSON configs) if trust_remote_code is used
+        copy_custom_model_files(args.pyt_ckpt_path, export_path, args.trust_remote_code)
 
         # Restore default padding and export the tokenizer as well.
         if tokenizer is not None:
@@ -661,6 +687,12 @@ if __name__ == "__main__":
         ),
         type=str,
         default="512",
+    )
+    parser.add_argument(
+        "--calib_seq",
+        help="Maximum sequence length for calibration.",
+        type=int,
+        default=512,
     )
     parser.add_argument("--export_path", default="exported_model")
     parser.add_argument(

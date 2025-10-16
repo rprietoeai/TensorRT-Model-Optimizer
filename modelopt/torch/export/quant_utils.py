@@ -50,6 +50,7 @@ from .model_config import (
     QUANTIZATION_FP8_PC_PT,
     QUANTIZATION_INT4_AWQ,
     QUANTIZATION_INT8_SQ,
+    QUANTIZATION_INT8_WO,
     QUANTIZATION_MXFP4,
     QUANTIZATION_NONE,
     QUANTIZATION_NVFP4,
@@ -269,12 +270,18 @@ def get_weight_scaling_factor(module: nn.Module, weight_name: str = "weight") ->
         QUANTIZATION_NVFP4_AWQ,
         QUANTIZATION_W4A8_NVFP4_FP8,
     ]:
+        if quantization_format == QUANTIZATION_W4A8_NVFP4_FP8:
+            # weight_scaling_factor_2 for w4a8 needs to be amax/448, so that the wsf is in range 448/6.
+            # This is because the kernel dequantizes weight to fp8, which is in range 448.
+            weight_scaling_factor_2 = weight_quantizer._amax.float() / 448.0
+        else:
+            weight_scaling_factor_2 = NVFP4QTensor.get_weights_scaling_factor_2_from_quantizer(
+                weight_quantizer
+            )
         return NVFP4QTensor.get_weights_scaling_factor(
             weight,
             weight_quantizer.block_sizes[-1],
-            NVFP4QTensor.get_weights_scaling_factor_2_from_quantizer(weight_quantizer).to(
-                weight.device
-            ),
+            weight_scaling_factor_2.to(weight.device),
         )[0]
 
     if quantization_format in [QUANTIZATION_W4A8_MXFP4_FP8, QUANTIZATION_MXFP4]:
@@ -294,9 +301,12 @@ def get_weight_scaling_factor_2(module: nn.Module, weight_name: str = "weight") 
     if get_quantization_format(module) in [
         QUANTIZATION_NVFP4,
         QUANTIZATION_NVFP4_AWQ,
-        QUANTIZATION_W4A8_NVFP4_FP8,
     ]:
         return NVFP4QTensor.get_weights_scaling_factor_2_from_quantizer(weight_quantizer)
+    elif get_quantization_format(module) == QUANTIZATION_W4A8_NVFP4_FP8:
+        # weight_scaling_factor_2 for w4a8 needs to be amax/448, so that the wsf is in range 448/6.
+        # This is because the kernel dequantizes weight to fp8, which is in range 448.
+        return weight_quantizer._amax.float() / 448.0
 
     # SequentialQuantizer is required
     if not isinstance(weight_quantizer, SequentialQuantizer) or not weight_quantizer[-1].is_enabled:
@@ -454,7 +464,10 @@ def get_quantization_format(module) -> str | None:
             return QUANTIZATION_INT4_AWQ
 
         if weight_quantizer.num_bits == 8:
-            return QUANTIZATION_INT8_SQ
+            if input_quantizer is not None and input_quantizer.is_enabled:
+                return QUANTIZATION_INT8_SQ
+            else:
+                return QUANTIZATION_INT8_WO
 
         if weight_quantizer.num_bits == (4, 3):
             if weight_quantizer.block_sizes:
@@ -626,6 +639,8 @@ def process_layer_quant_config(layer_config_dict):
                 "has_zero_point": False,
                 "pre_quant_scale": True,
             }
+        elif v == "int8_wo":
+            layer_config = {"quant_algo": "W8A16"}
         elif v == "int8_sq":
             layer_config = {"quant_algo": "W8A8_SQ_PER_CHANNEL"}
         elif v == "nvfp4":
@@ -751,7 +766,7 @@ def to_quantized_weight(
             return (weight / weights_scaling_factor.unsqueeze(-1)).to(torch.float8_e4m3fn)
         return (weight / weights_scaling_factor).to(torch.float8_e4m3fn)
 
-    if quantization == QUANTIZATION_INT8_SQ:
+    if quantization in [QUANTIZATION_INT8_SQ, QUANTIZATION_INT8_WO]:
         return (weight / weights_scaling_factor[:, None]).round().clamp(-128, 127).to(torch.int8)
 
     if quantization == QUANTIZATION_FP8_PB_WO:
@@ -803,7 +818,7 @@ def from_quantized_weight(
             torch_dtype
         )
 
-    if quantization == QUANTIZATION_INT8_SQ:
+    if quantization in [QUANTIZATION_INT8_SQ, QUANTIZATION_INT8_WO]:
         return weight.to(torch_dtype) * weights_scaling_factor[:, None].to(torch_dtype)
 
     raise NotImplementedError(f"quantization format {quantization} not supported")

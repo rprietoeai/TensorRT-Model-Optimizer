@@ -15,6 +15,7 @@
 
 """Support quantization for megatron linear layers."""
 
+import logging
 import warnings
 from typing import Any
 
@@ -22,6 +23,7 @@ import megatron.core.parallel_state as mcore_parallel
 import megatron.core.tensor_parallel.layers as megatron_parallel
 import megatron.core.transformer.mlp as megatron_mlp
 import torch
+from megatron.core.parallel_state import get_data_parallel_group
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
@@ -37,6 +39,8 @@ from ..nn import QuantModuleRegistry, TensorQuantizer
 from ..nn.modules.quant_linear import RealQuantLinear
 from ..qtensor import QTensorWrapper
 from .custom import CUSTOM_MODEL_PLUGINS, _ParallelLinear
+
+logger = logging.getLogger(__name__)
 
 __all__ = []
 
@@ -115,7 +119,7 @@ def real_quant_module_set_extra_state(self, state: Any):
     """
     q_tensor_state = state.get("modelopt_q_tensor_state", None)
 
-    if q_tensor_state is not None:
+    if q_tensor_state:
         q_tensor_metadata = q_tensor_state["metadata"]
         q_tensor_metadata["shape"] = self.weight.shape
         q_tensor_data_dtype = q_tensor_state["quantized_data.dtype"]
@@ -217,8 +221,14 @@ class _MegatronParallelLinear(_ParallelLinear):
     ]
 
     def _setup(self):
+        data_parallel_group = None
+        try:
+            data_parallel_group = get_data_parallel_group(with_context_parallel=True)
+        except AssertionError:
+            logger.warning("Context parallel group is not initialized, using data parallel group")
+            data_parallel_group = get_data_parallel_group()
         self.parallel_state = ParallelState(
-            getattr(mcore_parallel, "get_expert_data_parallel_group", "get_data_parallel_group")(),
+            data_parallel_group,
             mcore_parallel.get_tensor_model_parallel_group(),
         )
         super()._setup()
@@ -418,8 +428,10 @@ class _RealQuantMegatronParallelLinear(RealQuantLinear):
             while the original forward only takes 1 positional argument. We must above the fallback path
             in RealQuantLinear.forward().
         """
-        if self._should_run_real_quant_gemm and self.get_real_quant_gemm_impl(
-            input, *args, **kwargs
+        if (
+            self._should_run_real_quant_gemm
+            and input.numel() > 1
+            and self.has_real_quant_gemm_impl(input, *args, **kwargs)
         ):
             allreduce_dgrad = kwargs.get("allreduce_dgrad", False)
             tp_group = kwargs.get("tp_group")
