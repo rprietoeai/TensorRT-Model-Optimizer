@@ -66,9 +66,11 @@ nemotron_h_causal_lm_import: dict[str, CustomModuleMapping] = {
     "linear_fc1": NameRemapping("backbone.layers.{}.mixer.up_proj.", COL_TP),
     "linear_fc2": NameRemapping("backbone.layers.{}.mixer.down_proj.", ROW_TP),
     # MoE
-    "router": NameRemapping("model.layers.{}.mlp.gate.", REPLICATE),
+    "router": NameRemapping(
+        "backbone.layers.{}.mixer.gate.", {"mapping": {"expert_bias": "e_score_correction_bias"}}
+    ),
     "local_experts.linear_fc1": NameRemapping(
-        "backbone.layers.{}.mixer.experts.{}.up_proj", COL_ETP
+        "backbone.layers.{}.mixer.experts.{}.up_proj.", COL_ETP
     ),
     "local_experts.linear_fc2": NameRemapping(
         "backbone.layers.{}.mixer.experts.{}.down_proj.", ROW_ETP
@@ -104,7 +106,9 @@ nemotron_h_causal_lm_export: dict[str, CustomModuleMapping] = {
     "linear_fc1": NameRemapping("backbone.layers.{}.mixer.up_proj."),
     "linear_fc2": NameRemapping("backbone.layers.{}.mixer.down_proj."),
     # MoE
-    "router": NameRemapping("backbone.layers.{}.mlp.gate."),
+    "router": NameRemapping(
+        "backbone.layers.{}.mixer.gate.", {"mapping": {"expert_bias": "e_score_correction_bias"}}
+    ),
     "local_experts.linear_fc1": NameRemapping("backbone.layers.{}.mixer.experts.{}.up_proj."),
     "local_experts.linear_fc2": NameRemapping("backbone.layers.{}.mixer.experts.{}.down_proj."),
     "shared_experts.linear_fc1": NameRemapping("backbone.layers.{}.mixer.shared_experts.up_proj."),
