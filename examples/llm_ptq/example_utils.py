@@ -272,7 +272,7 @@ def _resolve_model_path(model_name_or_path: str, trust_remote_code: bool = False
         model_name_or_path,
         trust_remote_code=trust_remote_code,
         download_files=True,
-        allow_patterns=["*.py", "*.json"]  # Only download Python files and config
+        allow_patterns=["*.py", "*.json"],  # Only download Python files and config
     )
 
 
