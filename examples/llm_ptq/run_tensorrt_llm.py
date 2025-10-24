@@ -85,5 +85,6 @@ def run(args):
 
 
 if __name__ == "__main__":
+    hf_credentials.login_with_hf_credentials()
     args = parse_arguments()
     run(args)
