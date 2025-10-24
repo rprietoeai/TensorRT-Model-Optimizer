@@ -63,6 +63,8 @@ from modelopt.torch.utils.memory_monitor import launch_memory_monitor
 from modelopt.torch.utils.speech_dataset_utils import get_speech_dataset_dataloader
 from modelopt.torch.utils.vlm_dataset_utils import get_vlm_dataset_dataloader
 
+import hf_credentials
+
 RAND_SEED = 1234
 
 QUANT_CFG_CHOICES: dict[str, dict[str, Any]] = {
