@@ -20,7 +20,6 @@ import argparse
 import torch
 from example_utils import get_tokenizer
 from transformers import PreTrainedTokenizerBase
-import hf_credentials
 
 from modelopt.deploy.llm import LLM
 

@@ -646,6 +646,9 @@ def main(args):
 
 
 if __name__ == "__main__":
+    print("XXXXX LOGGING IN")
+    hf_credentials.login_with_hf_credentials()
+    print("XXXX DONE")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--pyt_ckpt_path",
